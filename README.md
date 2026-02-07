@@ -228,9 +228,24 @@ Creates `data/processed/benchmark/latency_benchmark.csv`.
 
 ### Run notebooks
 
+#### 1. Register the kernel (one-time setup)
+
+The notebooks need a Jupyter kernel that points to the project's virtual environment so all dependencies (PyTorch, YOLO, MediaPipe, etc.) are available.
+
+```bash
+# Install the kernel from the project's .venv
+uv run python -m ipykernel install --user --name pushup-tracker --display-name "Push-Up Tracker (Python 3.12)"
+```
+
+#### 2. Launch Jupyter
+
 ```bash
 uv run jupyter notebook notebooks/
 ```
+
+#### 3. Select the kernel
+
+When you open a notebook, go to **Kernel → Change kernel → Push-Up Tracker (Python 3.12)**. If the notebook was already using a different kernel, switch it — otherwise imports like `from src.pose_estimation import ...` will fail.
 
 Run in order: 01 (no model needed) -> 02 (loads models) -> 03 (needs CSVs from extraction).
 
