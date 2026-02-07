@@ -1,0 +1,31 @@
+# Quality assessment thresholds for push-up scoring
+scoring:
+  weights:
+    back_alignment: 0.4
+    depth: 0.35
+    extension: 0.25
+
+  # Back alignment: ideal is 180 degrees
+  back_alignment:
+    ideal_angle: 180.0
+    max_deviation: 45.0  # degrees; beyond this = score 0
+
+  # Depth: minimum elbow angle at bottom position
+  depth:
+    good_angle: 90.0      # degrees or less = score 100
+    poor_angle: 160.0     # degrees or more = score 0
+
+  # Extension: maximum elbow angle at top position
+  extension:
+    good_angle: 170.0     # degrees or more = score 100
+    poor_angle: 120.0     # degrees or less = score 0
+
+# State machine thresholds for rep counting
+counting:
+  down_threshold: 90.0    # elbow angle to trigger DOWN state
+  up_threshold: 160.0     # elbow angle to trigger UP state
+
+# Confidence thresholds
+detection:
+  min_confidence: 0.3     # minimum keypoint confidence to draw/use
+  min_visible_joints: 8   # minimum visible unified joints for valid frame
