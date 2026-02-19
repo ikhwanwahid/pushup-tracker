@@ -34,8 +34,14 @@ PHASE_COLORS = {
 }
 
 
-def _draw_overlay(frame: np.ndarray, result, sm: PushUpStateMachine, phase: PushUpPhase) -> None:
-    """Draw the info overlay (rep count, phase, angles, timing) on the frame."""
+def _draw_overlay(
+    frame: np.ndarray,
+    result,
+    sm: PushUpStateMachine,
+    phase: PushUpPhase,
+    form_result: tuple[str, float] | None = None,
+) -> None:
+    """Draw the info overlay (rep count, phase, angles, timing, form) on the frame."""
     h, w = frame.shape[:2]
 
     elbow = compute_elbow_angle(result.unified_keypoints)
@@ -44,7 +50,8 @@ def _draw_overlay(frame: np.ndarray, result, sm: PushUpStateMachine, phase: Push
 
     # Semi-transparent background for text readability
     overlay = frame.copy()
-    cv2.rectangle(overlay, (5, 5), (280, 175), (0, 0, 0), -1)
+    box_h = 207 if form_result else 175
+    cv2.rectangle(overlay, (5, 5), (280, box_h), (0, 0, 0), -1)
     cv2.addWeighted(overlay, 0.5, frame, 0.5, 0, frame)
 
     # Info lines
@@ -55,6 +62,17 @@ def _draw_overlay(frame: np.ndarray, result, sm: PushUpStateMachine, phase: Push
         (f"Back: {back:.0f} deg", (255, 255, 255), 0.6),
         (f"Inference: {result.inference_time_ms:.0f} ms", (180, 180, 180), 0.5),
     ]
+
+    # Add form feedback line if available
+    if form_result:
+        form_label, form_conf = form_result
+        if form_label == "correct":
+            form_color = (0, 255, 0)  # green
+        else:
+            form_color = (0, 0, 255)  # red
+        lines.append(
+            (f"Form: {form_label.upper()} ({form_conf:.0%})", form_color, 0.6)
+        )
 
     y = 30
     for text, color, scale in lines:
@@ -84,7 +102,7 @@ def run_live_demo(
         down_threshold: State machine down threshold.
         up_threshold: State machine up threshold.
     """
-    run_demo(estimator, source=camera_id, down_threshold=down_threshold, up_threshold=up_threshold)
+    run_demo(estimator, source=camera_id, down_threshold=down_threshold, up_threshold=up_threshold, form_checker=None)
 
 
 def run_demo(
@@ -93,6 +111,7 @@ def run_demo(
     down_threshold: float = 90.0,
     up_threshold: float = 160.0,
     save_path: str | None = None,
+    form_checker: "FormChecker | None" = None,
 ) -> None:
     """Run push-up tracking on webcam or video file.
 
@@ -102,6 +121,7 @@ def run_demo(
         down_threshold: State machine down threshold (degrees).
         up_threshold: State machine up threshold (degrees).
         save_path: If set, save annotated video to this path.
+        form_checker: Optional FormChecker for real-time form feedback.
     """
     is_video = isinstance(source, str)
     cap = cv2.VideoCapture(source)
@@ -141,7 +161,13 @@ def run_demo(
             if result.detected:
                 draw_skeleton(frame, result.unified_keypoints)
                 phase = sm.update_from_keypoints(result.unified_keypoints)
-                _draw_overlay(frame, result, sm, phase)
+
+                # Update form checker if available
+                form_result = None
+                if form_checker is not None:
+                    form_result = form_checker.update(result.unified_keypoints)
+
+                _draw_overlay(frame, result, sm, phase, form_result=form_result)
             else:
                 cv2.putText(frame, "No pose detected", (15, 30),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2, cv2.LINE_AA)
@@ -226,9 +252,18 @@ def main():
                         help="Elbow angle for 'down' position (default: 90)")
     parser.add_argument("--up-threshold", type=float, default=160.0,
                         help="Elbow angle for 'up' position (default: 160)")
+    parser.add_argument("--form-model", type=str, default=None,
+                        help="Path to trained ST-GCN model (.pt) for real-time form feedback")
     args = parser.parse_args()
 
     estimator = _load_model(args.model)
+
+    # Load form checker if model path provided
+    form_checker = None
+    if args.form_model:
+        from src.classification.form_checker import FormChecker
+        form_checker = FormChecker(args.form_model)
+        print(f"Form checker loaded: {args.form_model}")
 
     source = args.video if args.video else args.camera
     run_demo(
@@ -237,6 +272,7 @@ def main():
         down_threshold=args.down_threshold,
         up_threshold=args.up_threshold,
         save_path=args.save,
+        form_checker=form_checker,
     )
 
 
