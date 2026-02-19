@@ -43,7 +43,7 @@ uv run kaggle datasets download -d <dataset-id> -p data/raw/kaggle_pushups --unz
 uv run pytest tests/ -v
 ```
 
-All 23 tests should pass. No GPU required — everything runs on CPU.
+All 34 tests should pass. No GPU required — everything runs on CPU.
 
 ## Project Structure
 
@@ -58,7 +58,8 @@ pushup-tracker/
 │   │   ├── movenet_estimator.py    # MoveNet (not active — see below)
 │   │   └── visualization.py   # Skeleton drawing utilities
 │   ├── features/              # Angle computation, normalization, temporal
-│   ├── counting/              # State machine counter + LSTM phase detector
+│   ├── classification/        # Form classification (ST-GCN, 3D CNN, baseline)
+│   ├── counting/              # State machine rep counter
 │   ├── quality/               # RepScore scoring + text feedback
 │   ├── benchmark/
 │   │   ├── runner.py          # BenchmarkRunner (latency + full video)
@@ -68,10 +69,13 @@ pushup-tracker/
 │   ├── 01_data_exploration.ipynb    # Dataset inventory + metadata
 │   ├── 02_model_comparison.ipynb    # Visual comparison + stress test
 │   ├── 03_benchmark_analysis.ipynb  # Quantitative benchmark + stress test
-│   ├── 04–08                        # Feature eng, counting, quality (later phases)
+│   ├── 04_feature_engineering.ipynb    # Angle computation + normalization
+│   ├── 05_rep_counting_baseline.ipynb # State machine evaluation
+│   ├── 06_form_classification.ipynb   # ST-GCN vs 3D CNN comparison
+│   ├── 07–08                          # Quality assessment, final evaluation
 ├── configs/
 │   └── quality_thresholds.yaml
-├── tests/                     # 23 unit tests
+├── tests/                     # 34 unit tests
 ├── data/                      # gitignored — see "Get the dataset" above
 │   ├── raw/kaggle_pushups/    # 100 source videos
 │   ├── raw/stress_test/       # Challenge videos (see below)
@@ -81,7 +85,7 @@ pushup-tracker/
 └── pyproject.toml
 ```
 
-## What's Implemented (Phase 1 + Phase 2)
+## What's Implemented (Phases 1–3)
 
 ### Pose Estimation (2 models active)
 
@@ -101,22 +105,24 @@ MoveNet Lightning/Thunder wrappers exist in `movenet_estimator.py` but are **non
 
 ### Feature Engineering, Counting & Quality (Proof-of-Concept)
 
-> **Note:** The modules below are **backbone / proof-of-concept implementations**. They pass unit tests on synthetic data but have **not yet been validated or tuned on real push-up videos**. Thresholds, weights, and the LSTM model all need refinement in later phases (see notebooks 04–08).
-
 **Features** (`src/features/`)
 - Joint angle computation (elbow, shoulder, hip, knee)
 - Coordinate normalization (torso-length)
 - Temporal features (velocity, acceleration, Savitzky-Golay smoothing)
 
 **Counting** (`src/counting/`)
-- Rule-based state machine for rep counting (4-phase elbow angle transitions) — thresholds (90°/160°) are initial guesses, need tuning against real data
-- LSTM phase detector — architecture defined but **not yet trained**; training + comparison against the state machine is Phase 3 work (notebooks 05–06)
+- Rule-based state machine for rep counting (4-phase elbow angle transitions)
+
+### Form Classification (Phase 3)
+
+- **Logistic Regression baseline** on per-video angle statistics (16 features)
+- **3D CNN (R3D-18)**: Pretrained on Kinetics-400, fine-tuned FC layer for correct/incorrect
+- **ST-GCN**: Spatial-Temporal Graph Convolutional Network on skeleton sequences
+- 5-fold stratified cross-validation comparison of all three approaches
 
 **Quality** (`src/quality/`)
 - RepScore quality scorer (back alignment, depth, extension → composite 0–100) — scoring cutoffs are defaults, need validation
 - Text feedback generation from RepScore
-
-All of these are meant to be **built upon and refined** in the upcoming phases, not used as-is for final evaluation.
 
 ## Live Demo
 
@@ -151,6 +157,7 @@ uv run python -m src.demo.live --video path/to/video.mp4 --save output.mp4
 - **Rep count** — increments on each completed push-up
 - **Phase** — UP, GOING_DOWN, DOWN, GOING_UP (color-coded)
 - **Elbow angle** + **back alignment angle** (degrees)
+- **Form quality** — "CORRECT" / "INCORRECT" + confidence (when `--form-model` is provided)
 - Inference time (ms)
 - Phase indicator bar at the bottom
 - Progress bar for video files
@@ -173,6 +180,7 @@ uv run python -m src.demo.live --video path/to/video.mp4 --save output.mp4
 | `--save` | — | Save annotated video to this path |
 | `--down-threshold` | `90` | Elbow angle (degrees) for "down" position |
 | `--up-threshold` | `160` | Elbow angle (degrees) for "up" position |
+| `--form-model` | — | Path to trained ST-GCN model (.pt) for real-time form feedback |
 
 The model flag is **extensible** — when new models are added to the registry in `src/demo/live.py`, they become available automatically via `--model`.
 
@@ -189,7 +197,7 @@ The back alignment angle is displayed on screen but **not used** for counting or
 - **Tune thresholds**: The 90°/160° elbow angle cutoffs are initial guesses, not validated on real data (see notebook 05)
 - **Multi-angle counting**: Incorporate back alignment, hip angle, and knee angle into the state machine for more robust phase detection
 - **Live quality feedback**: Integrate the `QualityScorer` to show real-time form feedback (back sag warnings, depth cues, etc.)
-- **LSTM counter**: Swap in the trained LSTM phase detector as an alternative to the rule-based state machine (see notebook 06)
+- **Form classification**: Use `--form-model models/stgcn_best.pt` to enable real-time form feedback (requires running notebook 06 first to train the model)
 
 ---
 
@@ -286,16 +294,16 @@ uv run pytest tests/ -v
 
 ## For Teammates: What to Work On Next
 
-### Phase 3 — Feature Validation + Counting (notebooks 04–06)
+### Phase 3 — Feature Validation + Form Classification (notebooks 04–06)
 
 - **04 — Feature Engineering**: Visualize actual angle curves from extracted keypoints, sanity-check features on real data, identify any normalization issues
 - **05 — Rep Counting Baseline**: Run the state machine on real videos, tune the angle thresholds (currently 90°/160°), measure counting accuracy vs ground-truth labels
-- **06 — LSTM Training**: Train the LSTM phase detector on labeled sequences, compare accuracy against the tuned state machine
+- **06 — Form Classification**: Train and compare Logistic Regression baseline vs R3D-18 (3D CNN) vs ST-GCN on correct/incorrect form labels
 
-### Phase 4 — Quality + Final Evaluation (notebooks 07–08)
+### Phase 4 — Quality Assessment + Final Evaluation (notebooks 07–08)
 
 - **07 — Quality Assessment**: Run the quality scorer on real reps (correct vs incorrect), validate/tune scoring cutoffs, refine feedback messages
-- **08 — Final Evaluation**: End-to-end pipeline (best model → features → counting → quality) on held-out videos, summary figures + report
+- **08 — Final Evaluation**: End-to-end pipeline (best model → features → counting → quality → form) on held-out videos, summary figures + report
 
 ### Other
 
