@@ -5,7 +5,7 @@
 Automated exercise form analysis requires accurate, real-time human pose estimation. No single pose estimation model dominates across all metrics — speed, accuracy, and robustness vary significantly depending on the model architecture and the conditions of the input video. This project builds a push-up tracking system that:
 
 1. **Compares multiple pose estimation models** (YOLO11s-pose, MediaPipe Pose, MoveNet Lightning, MoveNet Thunder) on the same dataset using a unified evaluation framework.
-2. **Classifies push-up form** using a comparison of two CV paradigms: a pretrained 3D CNN (R3D-18) operating on raw video frames vs a Spatial-Temporal GCN operating on skeleton sequences, evaluated against a logistic regression baseline.
+2. **Classifies push-up form per-rep** using a comparison of two CV paradigms: a pretrained 3D CNN (R3D-18) operating on per-rep video clips vs a Spatial-Temporal GCN operating on per-rep skeleton sequences, evaluated against a logistic regression baseline.
 3. **Counts push-up repetitions** using a rule-based state machine.
 4. **Assesses push-up form quality** by scoring back alignment, depth, and arm extension per repetition.
 
@@ -64,26 +64,29 @@ UP  -->  GOING_DOWN  -->  DOWN  -->  GOING_UP  -->  UP (count += 1)
 
 Configurable thresholds in `configs/quality_thresholds.yaml`.
 
-## 4.5 Form Classification
+## 4.5 Form Classification (Per-Rep)
+
+The state machine segments each video into individual reps by tracking phase transitions (rep start = UP → GOING_DOWN, rep end = GOING_UP → UP). Each rep is classified independently as correct or incorrect. Labels are inherited from the parent video.
 
 ### Baseline — Logistic Regression
-- 16 per-video angle statistics (mean/min/max/range x 4 angles)
+- 16 per-rep angle statistics (mean/min/max/range x 4 angles)
 - StandardScaler + LogisticRegression pipeline via scikit-learn
 
 ### 3D CNN — R3D-18
 - Pretrained on Kinetics-400 (torchvision), frozen backbone
 - Fine-tune final FC layer (512 -> 2) for correct/incorrect
-- Input: 16 uniformly sampled video frames, 112x112
+- Input: 16 uniformly sampled frames from the rep's frame range, 112x112
 
 ### ST-GCN — Spatial-Temporal Graph Convolutional Network
 - Custom implementation using standard PyTorch (no torch_geometric)
 - Graph structure from unified 12-joint skeleton (12 nodes, 12 edges)
 - 3 ST-GCN blocks (2->64->64->128), global avg pool -> FC(128, 2)
-- Input: Torso-normalized (x,y) keypoint sequences, padded to 150 frames
+- Input: Torso-normalized (x,y) per-rep keypoint sequences, padded to 64 frames
 
 ### Evaluation
-- 5-fold stratified CV with identical splits across all 3 methods
-- Metrics: accuracy, F1, confusion matrix, per-video agreement
+- 5-fold stratified CV splitting by **video** (not by rep) to prevent data leakage
+- All reps from a video go to the same fold
+- Metrics: accuracy, F1, confusion matrix, per-rep error analysis
 
 ## 5. Quality Assessment
 
@@ -116,7 +119,7 @@ Composite score = weighted average (back 40%, depth 35%, extension 25%). Text fe
 - Benchmark harness ready to run
 - Feature engineering, counting, and quality modules implemented
 - Form classification module (ST-GCN, R3D-18, baseline) implemented
-- 34 unit tests passing
+- 43 unit tests passing
 - Notebooks 01-06 complete (data exploration through form classification)
 
 ## 7. Notebook Workflow
@@ -128,7 +131,7 @@ Composite score = weighted average (back 40%, depth 35%, extension 25%). Text fe
 | `03_benchmark_analysis` | 2 | Detection rate, latency, confidence analysis |
 | `04_feature_engineering` | 3 | Angle computation, normalization, temporal features |
 | `05_rep_counting_baseline` | 3 | State machine evaluation |
-| `06_form_classification` | 3-4 | Baseline vs R3D-18 vs ST-GCN comparison |
+| `06_form_classification` | 3-4 | Per-rep Baseline vs R3D-18 vs ST-GCN comparison |
 | `07_quality_assessment` | 5 | Scoring and feedback on correct vs incorrect videos |
 | `08_final_evaluation` | 6 | End-to-end pipeline results, summary figures |
 
@@ -156,7 +159,7 @@ pushup-tracker/
 ├── notebooks/                         # 01-08 analysis notebooks
 ├── models/                            # Saved weights (gitignored)
 ├── outputs/{figures,videos,results}/  # Generated outputs
-├── tests/                             # Unit tests (34 tests)
+├── tests/                             # Unit tests (43 tests)
 ├── Docs/                              # This document
 └── pyproject.toml                     # Dependencies + config
 ```
@@ -169,5 +172,6 @@ pushup-tracker/
 | onnxruntime over tflite-runtime | tflite-runtime unavailable on macOS ARM; onnxruntime is cross-platform |
 | 3 model families (not more) | YOLO + MediaPipe + MoveNet covers CNN, BlazePose, and MobileNet architectures without the fragility of mmpose/RTMPose |
 | ST-GCN for form classification | Graph structure models spatial joint relationships explicitly; captures body topology |
-| R3D-18 frozen backbone | Only 1,026 trainable params prevents overfitting on 100 videos |
-| 5-fold stratified CV | More robust than LOGO-CV with 100 folds; stratification ensures balanced class splits |
+| Per-rep classification | More training samples (~200-500 reps vs 100 videos), more granular feedback; labels inherited from parent video |
+| R3D-18 frozen backbone | Only 1,026 trainable params prevents overfitting on small dataset |
+| 5-fold stratified CV by video | Splits by video (not rep) to prevent data leakage; stratification ensures balanced class splits |
