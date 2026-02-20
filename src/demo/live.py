@@ -39,7 +39,7 @@ def _draw_overlay(
     result,
     sm: PushUpStateMachine,
     phase: PushUpPhase,
-    form_result: tuple[str, float] | None = None,
+    form_result: tuple[str, float, int] | None = None,
 ) -> None:
     """Draw the info overlay (rep count, phase, angles, timing, form) on the frame."""
     h, w = frame.shape[:2]
@@ -65,13 +65,13 @@ def _draw_overlay(
 
     # Add form feedback line if available
     if form_result:
-        form_label, form_conf = form_result
+        form_label, form_conf, rep_num = form_result
         if form_label == "correct":
             form_color = (0, 255, 0)  # green
         else:
             form_color = (0, 0, 255)  # red
         lines.append(
-            (f"Form: {form_label.upper()} ({form_conf:.0%})", form_color, 0.6)
+            (f"Rep {rep_num}: {form_label.upper()} ({form_conf:.0%})", form_color, 0.6)
         )
 
     y = 30
@@ -165,7 +165,7 @@ def run_demo(
                 # Update form checker if available
                 form_result = None
                 if form_checker is not None:
-                    form_result = form_checker.update(result.unified_keypoints)
+                    form_result = form_checker.update(result.unified_keypoints, phase)
 
                 _draw_overlay(frame, result, sm, phase, form_result=form_result)
             else:

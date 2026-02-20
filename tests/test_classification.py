@@ -2,11 +2,17 @@
 
 import numpy as np
 import torch
+import cv2
 import pytest
 
 from src.classification.stgcn import build_adjacency_matrix, PushUpSTGCN
 from src.classification.video_classifier import PushUpVideoClassifier
-from src.classification.datasets import PushUpSkeletonDataset, PushUpVideoDataset
+from src.classification.datasets import (
+    PushUpSkeletonDataset, PushUpVideoDataset,
+    PushUpRepSkeletonDataset, PushUpRepVideoDataset,
+)
+from src.classification.rep_segmenter import compute_rep_features
+from src.counting.state_machine import PushUpStateMachine
 
 
 class TestAdjacencyMatrix:
@@ -31,6 +37,13 @@ class TestSTGCN:
         out = model(x)
         assert out.shape == (2, 2)
 
+    def test_forward_shape_64(self):
+        """Test with per-rep sequence length."""
+        model = PushUpSTGCN(in_channels=2, num_classes=2)
+        x = torch.randn(2, 2, 64, 12)
+        out = model(x)
+        assert out.shape == (2, 2)
+
     def test_single_sample(self):
         model = PushUpSTGCN(in_channels=2, num_classes=2)
         x = torch.randn(1, 2, 50, 12)
@@ -40,7 +53,6 @@ class TestSTGCN:
     def test_param_count(self):
         model = PushUpSTGCN(in_channels=2, num_classes=2, dropout=0.2)
         n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        # Should be roughly ~245K, check it's in a reasonable range
         assert 100_000 < n_params < 500_000, f"Got {n_params} params"
 
 
@@ -54,22 +66,136 @@ class TestR3D:
     def test_frozen_params(self):
         model = PushUpVideoClassifier(freeze_backbone=True)
         trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        # Only FC layer: 512*2 + 2 = 1026
         assert trainable == 1026, f"Got {trainable} trainable params"
+
+
+def _make_fake_kps(n_frames=80):
+    """Create fake keypoints with reasonable shoulder/hip values."""
+    kps = np.random.rand(n_frames, 12, 3).astype(np.float32)
+    kps[:, 0, :2] = [100, 50]   # left_shoulder
+    kps[:, 1, :2] = [200, 50]   # right_shoulder
+    kps[:, 6, :2] = [100, 200]  # left_hip
+    kps[:, 7, :2] = [200, 200]  # right_hip
+    kps[:, :, 2] = 0.9
+    return kps
+
+
+class TestRepBoundaries:
+    def test_basic_rep(self):
+        """State machine should record rep boundary for a full cycle."""
+        sm = PushUpStateMachine(down_threshold=90, up_threshold=160)
+        # Simulate: UP -> GOING_DOWN -> DOWN -> GOING_UP -> UP
+        angles = (
+            [170] * 5 +    # UP (frames 0-4)
+            [150] * 5 +    # GOING_DOWN (frames 5-9)
+            [80] * 5 +     # DOWN (frames 10-14)
+            [100] * 5 +    # GOING_UP (frames 15-19)
+            [170] * 5      # UP again (frames 20-24) -> rep counted
+        )
+        for a in angles:
+            sm.update(a)
+
+        assert sm.count == 1
+        assert len(sm.rep_boundaries) == 1
+        start, end = sm.rep_boundaries[0]
+        assert start == 5   # UP -> GOING_DOWN transition
+        assert end == 20     # GOING_UP -> UP transition
+
+    def test_multiple_reps(self):
+        """Should track boundaries for multiple reps."""
+        sm = PushUpStateMachine(down_threshold=90, up_threshold=160)
+        cycle = [150] * 3 + [80] * 3 + [100] * 3 + [170] * 3
+        # Start in UP
+        for _ in range(3):
+            sm.update(170)
+        for _ in range(2):
+            for a in cycle:
+                sm.update(a)
+
+        assert sm.count == 2
+        assert len(sm.rep_boundaries) == 2
+
+    def test_segment_sequence(self):
+        """segment_sequence should return boundaries from keypoint array."""
+        sm = PushUpStateMachine()
+        # Create a keypoint sequence that produces at least one rep
+        # We need elbow angles to cross thresholds
+        # Elbow angle = angle at elbow joint (shoulder-elbow-wrist)
+        # Build synthetic keypoints where we control elbow angle
+        kps = _make_fake_kps(50)
+
+        # Run segment_sequence - may or may not find reps depending on angles
+        boundaries = sm.segment_sequence(kps)
+        assert isinstance(boundaries, list)
+        for start, end in boundaries:
+            assert start < end
+            assert start >= 0
+            assert end < 50
+
+    def test_reset_clears_boundaries(self):
+        sm = PushUpStateMachine(down_threshold=90, up_threshold=160)
+        angles = [170]*5 + [150]*5 + [80]*5 + [100]*5 + [170]*5
+        for a in angles:
+            sm.update(a)
+        assert len(sm.rep_boundaries) == 1
+        sm.reset()
+        assert len(sm.rep_boundaries) == 0
+        assert sm._frame_idx == 0
+
+
+class TestRepSkeletonDataset:
+    def test_shape(self):
+        kps = _make_fake_kps(40)
+        rep_segments = [{"keypoints": kps, "label": 0}]
+        dataset = PushUpRepSkeletonDataset(rep_segments, max_frames=64)
+        tensor, label = dataset[0]
+        assert tensor.shape == (2, 64, 12)
+        assert label == 0
+
+    def test_truncation(self):
+        kps = _make_fake_kps(100)
+        rep_segments = [{"keypoints": kps, "label": 1}]
+        dataset = PushUpRepSkeletonDataset(rep_segments, max_frames=64)
+        tensor, label = dataset[0]
+        assert tensor.shape == (2, 64, 12)
+        assert label == 1
+
+
+class TestRepVideoDataset:
+    def test_shape(self, tmp_path):
+        # Create a synthetic video
+        video_path = tmp_path / "test.mp4"
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        writer = cv2.VideoWriter(str(video_path), fourcc, 25.0, (640, 360))
+        for _ in range(60):
+            frame = np.random.randint(0, 255, (360, 640, 3), dtype=np.uint8)
+            writer.write(frame)
+        writer.release()
+
+        rep_segments = [{
+            "video_path": str(video_path),
+            "start_frame": 10,
+            "end_frame": 50,
+            "label": 0,
+        }]
+
+        dataset = PushUpRepVideoDataset(rep_segments, n_frames=16)
+        tensor, label = dataset[0]
+        assert tensor.shape == (3, 16, 112, 112)
+        assert label == 0
+
+
+class TestRepFeatures:
+    def test_shape(self):
+        kps = _make_fake_kps(30)
+        features = compute_rep_features(kps)
+        assert features.shape == (16,)
+        assert features.dtype == np.float32
 
 
 class TestSkeletonDataset:
     def test_shape(self, tmp_path):
-        """Verify output shape from skeleton dataset."""
-        # Create fake keypoints and manifest
-        kps = np.random.rand(80, 12, 3).astype(np.float32)
-        # Set reasonable shoulder/hip values so torso_normalize doesn't divide by zero
-        kps[:, 0, :2] = [100, 50]   # left_shoulder
-        kps[:, 1, :2] = [200, 50]   # right_shoulder
-        kps[:, 6, :2] = [100, 200]  # left_hip
-        kps[:, 7, :2] = [200, 200]  # right_hip
-        kps[:, :, 2] = 0.9  # confidence
-
+        kps = _make_fake_kps(80)
         np.save(tmp_path / "test_video.npy", kps)
 
         manifest = {
@@ -85,14 +211,10 @@ class TestSkeletonDataset:
 
         tensor, label = dataset[0]
         assert tensor.shape == (2, 150, 12)
-        assert label == 0  # correct
+        assert label == 0
 
     def test_incorrect_label(self, tmp_path):
-        kps = np.random.rand(50, 12, 3).astype(np.float32)
-        kps[:, 0, :2] = [100, 50]
-        kps[:, 1, :2] = [200, 50]
-        kps[:, 6, :2] = [100, 200]
-        kps[:, 7, :2] = [200, 200]
+        kps = _make_fake_kps(50)
         np.save(tmp_path / "wrong_video.npy", kps)
 
         manifest = {
@@ -107,13 +229,11 @@ class TestSkeletonDataset:
         )
 
         _, label = dataset[0]
-        assert label == 1  # incorrect
+        assert label == 1
 
 
 class TestVideoDataset:
     def test_shape(self, tmp_path):
-        """Verify output shape from video dataset using a synthetic video."""
-        # Create a tiny synthetic video
         video_path = tmp_path / "Correct sequence" / "test.mp4"
         video_path.parent.mkdir(parents=True)
 
@@ -141,7 +261,3 @@ class TestVideoDataset:
         tensor, label = dataset[0]
         assert tensor.shape == (3, 16, 112, 112)
         assert label == 0
-
-
-# Import cv2 at module level for the video test
-import cv2

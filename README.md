@@ -43,7 +43,7 @@ uv run kaggle datasets download -d <dataset-id> -p data/raw/kaggle_pushups --unz
 uv run pytest tests/ -v
 ```
 
-All 34 tests should pass. No GPU required — everything runs on CPU.
+All 43 tests should pass. No GPU required — everything runs on CPU.
 
 ## Project Structure
 
@@ -58,7 +58,7 @@ pushup-tracker/
 │   │   ├── movenet_estimator.py    # MoveNet (not active — see below)
 │   │   └── visualization.py   # Skeleton drawing utilities
 │   ├── features/              # Angle computation, normalization, temporal
-│   ├── classification/        # Form classification (ST-GCN, 3D CNN, baseline)
+│   ├── classification/        # Per-rep form classification (ST-GCN, 3D CNN, baseline)
 │   ├── counting/              # State machine rep counter
 │   ├── quality/               # RepScore scoring + text feedback
 │   ├── benchmark/
@@ -71,11 +71,11 @@ pushup-tracker/
 │   ├── 03_benchmark_analysis.ipynb  # Quantitative benchmark + stress test
 │   ├── 04_feature_engineering.ipynb    # Angle computation + normalization
 │   ├── 05_rep_counting_baseline.ipynb # State machine evaluation
-│   ├── 06_form_classification.ipynb   # ST-GCN vs 3D CNN comparison
+│   ├── 06_form_classification.ipynb   # Per-rep ST-GCN vs 3D CNN comparison
 │   ├── 07–08                          # Quality assessment, final evaluation
 ├── configs/
 │   └── quality_thresholds.yaml
-├── tests/                     # 34 unit tests
+├── tests/                     # 43 unit tests
 ├── data/                      # gitignored — see "Get the dataset" above
 │   ├── raw/kaggle_pushups/    # 100 source videos
 │   ├── raw/stress_test/       # Challenge videos (see below)
@@ -115,10 +115,12 @@ MoveNet Lightning/Thunder wrappers exist in `movenet_estimator.py` but are **non
 
 ### Form Classification (Phase 3)
 
-- **Logistic Regression baseline** on per-video angle statistics (16 features)
-- **3D CNN (R3D-18)**: Pretrained on Kinetics-400, fine-tuned FC layer for correct/incorrect
-- **ST-GCN**: Spatial-Temporal Graph Convolutional Network on skeleton sequences
-- 5-fold stratified cross-validation comparison of all three approaches
+Classifies each individual push-up repetition as correct or incorrect (not whole videos). The state machine segments videos into reps, and each rep is classified independently. Labels are inherited from the parent video (all reps in a "correct" video are labeled correct).
+
+- **Logistic Regression baseline** on per-rep angle statistics (16 features)
+- **3D CNN (R3D-18)**: Pretrained on Kinetics-400, fine-tuned FC layer on per-rep video clips
+- **ST-GCN**: Spatial-Temporal Graph Convolutional Network on per-rep skeleton sequences
+- 5-fold stratified CV — splits by video to prevent data leakage, trains/evaluates on rep-level samples
 
 **Quality** (`src/quality/`)
 - RepScore quality scorer (back alignment, depth, extension → composite 0–100) — scoring cutoffs are defaults, need validation
@@ -157,7 +159,7 @@ uv run python -m src.demo.live --video path/to/video.mp4 --save output.mp4
 - **Rep count** — increments on each completed push-up
 - **Phase** — UP, GOING_DOWN, DOWN, GOING_UP (color-coded)
 - **Elbow angle** + **back alignment angle** (degrees)
-- **Form quality** — "CORRECT" / "INCORRECT" + confidence (when `--form-model` is provided)
+- **Per-rep form quality** — "Rep 3: CORRECT (94%)" after each completed rep (when `--form-model` is provided)
 - Inference time (ms)
 - Phase indicator bar at the bottom
 - Progress bar for video files
@@ -298,7 +300,7 @@ uv run pytest tests/ -v
 
 - **04 — Feature Engineering**: Visualize actual angle curves from extracted keypoints, sanity-check features on real data, identify any normalization issues
 - **05 — Rep Counting Baseline**: Run the state machine on real videos, tune the angle thresholds (currently 90°/160°), measure counting accuracy vs ground-truth labels
-- **06 — Form Classification**: Train and compare Logistic Regression baseline vs R3D-18 (3D CNN) vs ST-GCN on correct/incorrect form labels
+- **06 — Form Classification**: Train and compare Logistic Regression baseline vs R3D-18 (3D CNN) vs ST-GCN on per-rep correct/incorrect form labels
 
 ### Phase 4 — Quality Assessment + Final Evaluation (notebooks 07–08)
 

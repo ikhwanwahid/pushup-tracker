@@ -1,7 +1,10 @@
 """Dataset classes for push-up form classification.
 
-PushUpVideoDataset: Loads raw video frames for 3D CNN (R3D-18).
-PushUpSkeletonDataset: Loads keypoint sequences for ST-GCN.
+Per-video classes (used by FormChecker rolling buffer):
+  PushUpVideoDataset, PushUpSkeletonDataset
+
+Per-rep classes (used by training pipeline):
+  PushUpRepSkeletonDataset, PushUpRepVideoDataset
 """
 
 from pathlib import Path
@@ -156,3 +159,121 @@ class PushUpSkeletonDataset(Dataset):
         tensor = torch.from_numpy(processed).permute(2, 0, 1)  # (2, T, 12)
 
         return tensor, label
+
+
+def _process_skeleton_frames(kps: np.ndarray, max_frames: int, normalize: bool = True) -> np.ndarray:
+    """Shared preprocessing for skeleton data: normalize, center, extract xy, pad/truncate.
+
+    Args:
+        kps: (T, 12, 3) keypoints.
+        max_frames: Target sequence length.
+        normalize: Whether to apply torso normalization.
+
+    Returns:
+        (2, max_frames, 12) float32 array.
+    """
+    T = len(kps)
+    processed = []
+    for t in range(T):
+        frame_kps = kps[t].copy()
+        if normalize:
+            frame_kps = torso_normalize(frame_kps)
+        hip_mid = (frame_kps[6, :2] + frame_kps[7, :2]) / 2.0
+        frame_kps[:, :2] -= hip_mid
+        processed.append(frame_kps[:, :2])
+
+    processed = np.stack(processed)  # (T, 12, 2)
+
+    if T < max_frames:
+        pad = np.zeros((max_frames - T, 12, 2), dtype=np.float32)
+        processed = np.concatenate([processed, pad], axis=0)
+    else:
+        processed = processed[:max_frames]
+
+    return processed.astype(np.float32).transpose(2, 0, 1)  # (2, max_frames, 12)
+
+
+def _load_video_frames(
+    video_path: str, start_frame: int, end_frame: int, n_frames: int,
+) -> np.ndarray:
+    """Load and preprocess video frames from a frame range.
+
+    Returns:
+        (3, n_frames, 112, 112) float32 array, Kinetics-normalized.
+    """
+    cap = cv2.VideoCapture(video_path)
+    indices = np.linspace(start_frame, end_frame, n_frames).astype(int)
+
+    frames = []
+    for frame_idx in indices:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+        ret, frame = cap.read()
+        if not ret:
+            frame = np.zeros((112, 112, 3), dtype=np.uint8)
+        else:
+            frame = cv2.resize(frame, (171, 128))
+            y_off = (128 - 112) // 2
+            x_off = (171 - 112) // 2
+            frame = frame[y_off:y_off + 112, x_off:x_off + 112]
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        frames.append(frame)
+    cap.release()
+
+    video = np.stack(frames).astype(np.float32) / 255.0
+    video = video.transpose(3, 0, 1, 2)  # (3, T, 112, 112)
+
+    mean = np.array(KINETICS_MEAN, dtype=np.float32).reshape(3, 1, 1, 1)
+    std = np.array(KINETICS_STD, dtype=np.float32).reshape(3, 1, 1, 1)
+    return (video - mean) / std
+
+
+class PushUpRepSkeletonDataset(Dataset):
+    """Per-rep skeleton dataset for ST-GCN.
+
+    Takes pre-segmented rep dicts from rep_segmenter.segment_all_videos().
+
+    Returns:
+        (2, max_frames, 12) float32 tensor, label (0=correct, 1=incorrect)
+    """
+
+    def __init__(self, rep_segments: list[dict], max_frames: int = 64, normalize: bool = True):
+        self.rep_segments = rep_segments
+        self.max_frames = max_frames
+        self.normalize = normalize
+
+    def __len__(self) -> int:
+        return len(self.rep_segments)
+
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, int]:
+        rep = self.rep_segments[idx]
+        kps = rep["keypoints"]  # (T_rep, 12, 3)
+        label = rep["label"]
+
+        tensor = _process_skeleton_frames(kps, self.max_frames, self.normalize)
+        return torch.from_numpy(tensor), label
+
+
+class PushUpRepVideoDataset(Dataset):
+    """Per-rep video dataset for R3D-18.
+
+    Takes pre-segmented rep dicts with video path and frame boundaries.
+
+    Returns:
+        (3, n_frames, 112, 112) float32 tensor, label (0=correct, 1=incorrect)
+    """
+
+    def __init__(self, rep_segments: list[dict], n_frames: int = 16):
+        self.rep_segments = rep_segments
+        self.n_frames = n_frames
+
+    def __len__(self) -> int:
+        return len(self.rep_segments)
+
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, int]:
+        rep = self.rep_segments[idx]
+        label = rep["label"]
+
+        video = _load_video_frames(
+            rep["video_path"], rep["start_frame"], rep["end_frame"], self.n_frames,
+        )
+        return torch.from_numpy(video), label

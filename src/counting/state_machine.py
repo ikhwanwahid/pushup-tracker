@@ -37,6 +37,9 @@ class PushUpStateMachine:
         self.state = PushUpPhase.UP
         self.count = 0
         self._phase_history: list[PushUpPhase] = []
+        self._frame_idx: int = 0
+        self._current_rep_start: int | None = None
+        self._rep_boundaries: list[tuple[int, int]] = []
 
     def update(self, elbow_angle: float) -> PushUpPhase:
         """Update state machine with a new elbow angle reading.
@@ -47,6 +50,8 @@ class PushUpStateMachine:
         Returns:
             Current phase after the update.
         """
+        prev_state = self.state
+
         if self.state == PushUpPhase.UP:
             if elbow_angle < self.up_threshold:
                 self.state = PushUpPhase.GOING_DOWN
@@ -63,8 +68,19 @@ class PushUpStateMachine:
             if elbow_angle >= self.up_threshold:
                 self.state = PushUpPhase.UP
                 self.count += 1
+                # Record rep boundary
+                if self._current_rep_start is not None:
+                    self._rep_boundaries.append(
+                        (self._current_rep_start, self._frame_idx)
+                    )
+                self._current_rep_start = None
+
+        # Track rep start: UP -> GOING_DOWN
+        if prev_state == PushUpPhase.UP and self.state == PushUpPhase.GOING_DOWN:
+            self._current_rep_start = self._frame_idx
 
         self._phase_history.append(self.state)
+        self._frame_idx += 1
         return self.state
 
     def update_from_keypoints(self, unified_kps) -> PushUpPhase:
@@ -84,11 +100,19 @@ class PushUpStateMachine:
         self.state = PushUpPhase.UP
         self.count = 0
         self._phase_history.clear()
+        self._frame_idx = 0
+        self._current_rep_start = None
+        self._rep_boundaries.clear()
 
     @property
     def phase_history(self) -> list[PushUpPhase]:
         """Full history of phase labels, one per frame processed."""
         return self._phase_history.copy()
+
+    @property
+    def rep_boundaries(self) -> list[tuple[int, int]]:
+        """List of (start_frame, end_frame) for each completed rep."""
+        return self._rep_boundaries.copy()
 
     def label_sequence(self, kps_sequence) -> list[PushUpPhase]:
         """Label an entire keypoint sequence with phases.
@@ -104,3 +128,15 @@ class PushUpStateMachine:
         for kps in kps_sequence:
             labels.append(self.update_from_keypoints(kps))
         return labels
+
+    def segment_sequence(self, kps_sequence) -> list[tuple[int, int]]:
+        """Run state machine on a keypoint sequence and return rep boundaries.
+
+        Args:
+            kps_sequence: Array of shape (T, 12, 3).
+
+        Returns:
+            List of (start_frame, end_frame) tuples, one per completed rep.
+        """
+        self.label_sequence(kps_sequence)
+        return self.rep_boundaries
