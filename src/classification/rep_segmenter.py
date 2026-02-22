@@ -21,6 +21,8 @@ def segment_all_videos(
     manifest: dict,
     keypoint_dir: str | Path,
     min_rep_frames: int = MIN_REP_FRAMES,
+    down_threshold: float = 90.0,
+    up_threshold: float = 160.0,
 ) -> list[dict]:
     """Segment all videos into individual reps.
 
@@ -31,6 +33,8 @@ def segment_all_videos(
         manifest: Video manifest dict (video_id -> metadata with "label").
         keypoint_dir: Path to directory containing {video_id}.npy files.
         min_rep_frames: Minimum frames for a valid rep (filters degenerate reps).
+        down_threshold: Elbow angle for "down" position (degrees).
+        up_threshold: Elbow angle for "up" position (degrees).
 
     Returns:
         List of rep dicts, each containing:
@@ -52,7 +56,9 @@ def segment_all_videos(
         kps = np.load(npy_path)  # (T, 12, 3)
         label = 0 if manifest[video_id]["label"] == "correct" else 1
 
-        sm = PushUpStateMachine()
+        sm = PushUpStateMachine(
+            down_threshold=down_threshold, up_threshold=up_threshold
+        )
         boundaries = sm.segment_sequence(kps)
 
         for rep_idx, (start, end) in enumerate(boundaries):
