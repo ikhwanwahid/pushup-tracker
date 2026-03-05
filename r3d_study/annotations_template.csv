@@ -1,0 +1,9 @@
+video_filename,rep_number,start_frame,end_frame,label,shallow,partial_ext,hip_sag,hip_pike,uncontrolled,incomplete,annotator,notes
+alice_good_01.mp4,1,18,72,good,0,0,0,0,0,0,alice,
+alice_good_01.mp4,2,75,130,good,0,0,0,0,0,0,alice,
+alice_bad_01.mp4,1,10,45,bad,1,0,0,0,0,0,alice,didn't go low enough
+alice_bad_01.mp4,2,48,90,bad,0,0,1,0,1,0,alice,hips sagging + jerky descent
+bob_good_01.mp4,1,15,60,good,0,0,0,0,0,0,bob,
+bob_good_01.mp4,2,63,110,good,0,0,0,0,0,0,bob,
+bob_bad_01.mp4,1,12,38,bad,0,1,0,0,0,0,bob,arms not fully straight at top
+bob_bad_01.mp4,2,40,55,bad,0,0,0,0,0,1,bob,gave up halfway through
