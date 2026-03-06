@@ -25,32 +25,46 @@ KINETICS_STD = np.array([0.22803, 0.22145, 0.216989], dtype=np.float32)
 MIN_KP_CONFIDENCE = 0.3
 BBOX_PAD_RATIO = 0.25  # 25% padding around keypoint bounding box
 
-# Global frame cache: video_path -> {frame_idx: BGR numpy array}
-_frame_cache: dict[str, dict[int, np.ndarray]] = {}
+# Global frame cache: (video_path, frame_idx) -> BGR numpy array
+_frame_cache: dict[tuple[str, int], np.ndarray] = {}
 
 
-def preload_videos(rep_segments: list[dict]) -> None:
-    """Pre-decode all unique videos into memory (one-time cost).
+def preload_videos(rep_segments: list[dict], n_frames: int = 16, jitter: int = 2) -> None:
+    """Pre-decode only the frames needed for each rep (memory-efficient).
 
-    Call this once before training to avoid repeated video I/O.
+    Samples n_frames per rep using uniform spacing, plus ±jitter frames
+    to cover augmentation jitter during training.
     """
-    paths = {rep["video_path"] for rep in rep_segments}
-    for path in sorted(paths):
-        if path in _frame_cache:
+    needed: dict[str, set[int]] = {}
+    for rep in rep_segments:
+        path = rep["video_path"]
+        start, end = rep["start_frame"], rep["end_frame"]
+        indices = _uniform_sample_indices(start, end, n_frames)
+        if path not in needed:
+            needed[path] = set()
+        for i in indices:
+            for offset in range(-jitter, jitter + 1):
+                idx = max(start, min(end, int(i) + offset))
+                needed[path].add(idx)
+
+    total_frames = sum(len(idxs) for idxs in needed.values())
+    logger.info("Pre-loading %d frames from %d videos...", total_frames, len(needed))
+
+    for path in sorted(needed):
+        frame_indices = sorted(needed[path])
+        to_load = [i for i in frame_indices if (path, i) not in _frame_cache]
+        if not to_load:
             continue
+
         cap = cv2.VideoCapture(path)
-        frames = {}
-        idx = 0
-        while True:
+        for idx in to_load:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
             ret, frame = cap.read()
-            if not ret:
-                break
-            frames[idx] = frame
-            idx += 1
+            if ret:
+                _frame_cache[(path, idx)] = frame
         cap.release()
-        _frame_cache[path] = frames
-        logger.info("Cached %s: %d frames", path.split("/")[-1], len(frames))
-    logger.info("Frame cache: %d videos loaded", len(_frame_cache))
+
+    logger.info("Frame cache: %d frames loaded", len(_frame_cache))
 
 
 def _uniform_sample_indices(start: int, end: int, n: int) -> np.ndarray:
@@ -69,19 +83,27 @@ def _jittered_sample_indices(
 
 def _read_frames(video_path: str, frame_indices: np.ndarray) -> list[np.ndarray]:
     """Read specific frames — from cache if available, else from disk."""
-    cached = _frame_cache.get(video_path)
-    if cached is not None:
-        return [cached.get(int(idx)) for idx in frame_indices]
+    # Try cache first
+    if _frame_cache:
+        frames = []
+        fallback_needed = False
+        for idx in frame_indices:
+            cached = _frame_cache.get((video_path, int(idx)))
+            if cached is not None:
+                frames.append(cached)
+            else:
+                fallback_needed = True
+                break
+        if not fallback_needed:
+            return frames
 
+    # Fallback to disk
     cap = cv2.VideoCapture(video_path)
     frames = []
     for idx in frame_indices:
         cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
         ret, frame = cap.read()
-        if not ret:
-            frames.append(None)
-        else:
-            frames.append(frame)
+        frames.append(frame if ret else None)
     cap.release()
     return frames
 
