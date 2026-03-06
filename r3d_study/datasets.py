@@ -1,15 +1,17 @@
 """Dataset classes for R3D-18 study.
 
-Two variants:
-  - PushUpRepVideoDataset: full-frame (resize + crop)
-  - PushUpRepCroppedVideoDataset: YOLO-crop (keypoint bbox + resize)
+Three modes:
+  - PushUpRepVideoDataset: full-frame (resize + crop) — reads from video
+  - PushUpRepCroppedVideoDataset: YOLO-crop (keypoint bbox + resize) — reads from video
+  - PrecomputedDataset: loads pre-extracted frames from disk (fastest)
 
-Both support train-time augmentation (horizontal flip, random crop,
-temporal jitter, color jitter).
+Use precompute_tensors() once to save preprocessed frames, then
+PrecomputedDataset for all training — no video decoding needed.
 """
 
 import logging
 import random
+from pathlib import Path
 
 import cv2
 import numpy as np
@@ -310,3 +312,118 @@ class PushUpRepCroppedVideoDataset(Dataset):
 
         tensor = _to_tensor(processed)
         return torch.from_numpy(tensor), rep["label"]
+
+
+# ============================================================
+# Precomputed pipeline — save preprocessed frames to disk once
+# ============================================================
+
+def _rep_id(rep: dict) -> str:
+    """Generate a unique ID for a rep based on video + frame range."""
+    return f"{rep['video_id']}_f{rep['start_frame']}-{rep['end_frame']}"
+
+
+def precompute_tensors(
+    rep_segments: list[dict],
+    output_dir: str | Path,
+    n_frames: int = 16,
+    mode: str = "full",
+) -> None:
+    """Pre-extract and save preprocessed frames for all reps.
+
+    Saves each rep as a .npy file containing (n_frames, 112, 112, 3) uint8 RGB frames.
+    Skips reps that already have a saved file.
+
+    Args:
+        rep_segments: List of rep dicts.
+        output_dir: Directory to save .npy files (e.g., "precomputed/full" or "precomputed/crop").
+        n_frames: Number of frames to sample per rep.
+        mode: "full" for full-frame preprocessing, "crop" for YOLO-crop.
+    """
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    skipped = 0
+    saved = 0
+
+    for i, rep in enumerate(rep_segments):
+        rid = _rep_id(rep)
+        npy_path = output_dir / f"{rid}.npy"
+
+        if npy_path.exists():
+            skipped += 1
+            continue
+
+        indices = _uniform_sample_indices(rep["start_frame"], rep["end_frame"], n_frames)
+        raw_frames = _read_frames(rep["video_path"], indices)
+
+        if mode == "crop" and "keypoints" in rep:
+            kps = rep["keypoints"]
+            start = rep["start_frame"]
+            processed = []
+            for frame, fi in zip(raw_frames, indices):
+                kp_idx = max(0, min(int(fi) - start, len(kps) - 1))
+                processed.append(_preprocess_cropped_frame(frame, kps[kp_idx]))
+        else:
+            processed = [_preprocess_full_frame(f) for f in raw_frames]
+
+        # Save as uint8 RGB (before normalization) so augmentation still works
+        frames_array = np.stack(processed)  # (n_frames, 112, 112, 3)
+        np.save(npy_path, frames_array)
+        saved += 1
+
+        if (saved + skipped) % 50 == 0:
+            logger.info("  Precomputed %d/%d reps...", saved + skipped, len(rep_segments))
+
+    logger.info(
+        "Precompute done: %d saved, %d skipped (already existed) in %s",
+        saved, skipped, output_dir,
+    )
+
+
+class PrecomputedDataset(Dataset):
+    """Dataset that loads pre-extracted frames from disk.
+
+    Each .npy file contains (n_frames, 112, 112, 3) uint8 RGB frames.
+    Augmentation (flip, color jitter) is applied on-the-fly — these are
+    cheap tensor ops, no video decoding needed.
+
+    Args:
+        rep_segments: List of rep dicts (needs video_id, start_frame, end_frame, label).
+        precomputed_dir: Directory containing {rep_id}.npy files.
+        augment: If True, apply random augmentations.
+    """
+
+    def __init__(
+        self,
+        rep_segments: list[dict],
+        precomputed_dir: str | Path,
+        augment: bool = False,
+    ):
+        self.precomputed_dir = Path(precomputed_dir)
+        self.augment = augment
+
+        # Only keep reps that have precomputed files
+        self.reps = []
+        for rep in rep_segments:
+            rid = _rep_id(rep)
+            npy_path = self.precomputed_dir / f"{rid}.npy"
+            if npy_path.exists():
+                self.reps.append({"rep": rep, "path": npy_path})
+            else:
+                logger.warning("No precomputed file for %s, skipping", rid)
+
+    def __len__(self) -> int:
+        return len(self.reps)
+
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, int]:
+        entry = self.reps[idx]
+        frames = np.load(entry["path"])  # (n_frames, 112, 112, 3) uint8 RGB
+
+        frame_list = [frames[i] for i in range(len(frames))]
+
+        if self.augment:
+            frame_list = _apply_augmentation(frame_list)
+
+        tensor = _to_tensor(frame_list)
+        return torch.from_numpy(tensor), entry["rep"]["label"]

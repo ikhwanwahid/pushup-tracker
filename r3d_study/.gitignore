@@ -1,6 +1,7 @@
 # Generated data (re-created by notebook)
 keypoints/
 outputs/
+precomputed/
 
 # Videos (too large for git)
 videos/
