@@ -178,6 +178,9 @@ def run_rep_kfold_cv(
         best_val_acc = 0.0
         best_epoch_state = None
         epochs_without_improvement = 0
+        epoch_train_losses = []
+        epoch_val_losses = []
+        epoch_val_accs = []
 
         for epoch in range(n_epochs):
             train_loss = train_one_epoch(
@@ -186,6 +189,10 @@ def run_rep_kfold_cv(
             val_loss, val_acc, _, _ = evaluate(
                 model, val_loader, criterion, device,
             )
+
+            epoch_train_losses.append(train_loss)
+            epoch_val_losses.append(val_loss)
+            epoch_val_accs.append(val_acc)
 
             marker = " *" if val_acc > best_val_acc else ""
             print(
@@ -228,6 +235,9 @@ def run_rep_kfold_cv(
             "val_accuracy": final_acc,
             "n_train_reps": len(train_reps),
             "n_val_reps": len(val_reps),
+            "epoch_train_losses": epoch_train_losses,
+            "epoch_val_losses": epoch_val_losses,
+            "epoch_val_accs": epoch_val_accs,
         })
 
         logger.info("Fold %d: val_accuracy=%.4f", fold, final_acc)
