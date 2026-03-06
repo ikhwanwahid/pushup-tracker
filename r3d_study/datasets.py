@@ -83,28 +83,22 @@ def _jittered_sample_indices(
 
 def _read_frames(video_path: str, frame_indices: np.ndarray) -> list[np.ndarray]:
     """Read specific frames — from cache if available, else from disk."""
-    # Try cache first
-    if _frame_cache:
-        frames = []
-        fallback_needed = False
-        for idx in frame_indices:
-            cached = _frame_cache.get((video_path, int(idx)))
-            if cached is not None:
-                frames.append(cached)
-            else:
-                fallback_needed = True
-                break
-        if not fallback_needed:
-            return frames
-
-    # Fallback to disk
-    cap = cv2.VideoCapture(video_path)
     frames = []
+    cap = None
+
     for idx in frame_indices:
-        cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
-        ret, frame = cap.read()
-        frames.append(frame if ret else None)
-    cap.release()
+        cached = _frame_cache.get((video_path, int(idx)))
+        if cached is not None:
+            frames.append(cached)
+        else:
+            if cap is None:
+                cap = cv2.VideoCapture(video_path)
+            cap.set(cv2.CAP_PROP_POS_FRAMES, int(idx))
+            ret, frame = cap.read()
+            frames.append(frame if ret else None)
+
+    if cap is not None:
+        cap.release()
     return frames
 
 
