@@ -105,7 +105,8 @@ def main():
     for arg in sys.argv[1:]:
         p = Path(arg)
         if p.is_dir():
-            video_paths.extend(sorted(p.glob("*.mp4")))
+            for ext in ("*.mp4", "*.avi", "*.mov", "*.mkv", "*.MOV", "*.MP4"):
+                video_paths.extend(sorted(p.glob(ext)))
         elif p.exists():
             video_paths.append(p)
         else:
