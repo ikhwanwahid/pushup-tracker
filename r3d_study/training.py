@@ -187,6 +187,13 @@ def run_rep_kfold_cv(
                 model, val_loader, criterion, device,
             )
 
+            marker = " *" if val_acc > best_val_acc else ""
+            print(
+                f"  Fold {fold} | Epoch {epoch+1:02d}/{n_epochs} | "
+                f"train_loss={train_loss:.4f} | val_loss={val_loss:.4f} | "
+                f"val_acc={val_acc:.1%}{marker}"
+            )
+
             if val_acc > best_val_acc:
                 best_val_acc = val_acc
                 best_epoch_state = {
