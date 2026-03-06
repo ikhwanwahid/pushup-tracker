@@ -8,6 +8,7 @@ Both support train-time augmentation (horizontal flip, random crop,
 temporal jitter, color jitter).
 """
 
+import logging
 import random
 
 import cv2
@@ -15,12 +16,41 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
+logger = logging.getLogger(__name__)
+
 # Kinetics-400 normalization stats
 KINETICS_MEAN = np.array([0.43216, 0.394666, 0.37645], dtype=np.float32)
 KINETICS_STD = np.array([0.22803, 0.22145, 0.216989], dtype=np.float32)
 
 MIN_KP_CONFIDENCE = 0.3
 BBOX_PAD_RATIO = 0.25  # 25% padding around keypoint bounding box
+
+# Global frame cache: video_path -> {frame_idx: BGR numpy array}
+_frame_cache: dict[str, dict[int, np.ndarray]] = {}
+
+
+def preload_videos(rep_segments: list[dict]) -> None:
+    """Pre-decode all unique videos into memory (one-time cost).
+
+    Call this once before training to avoid repeated video I/O.
+    """
+    paths = {rep["video_path"] for rep in rep_segments}
+    for path in sorted(paths):
+        if path in _frame_cache:
+            continue
+        cap = cv2.VideoCapture(path)
+        frames = {}
+        idx = 0
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            frames[idx] = frame
+            idx += 1
+        cap.release()
+        _frame_cache[path] = frames
+        logger.info("Cached %s: %d frames", path.split("/")[-1], len(frames))
+    logger.info("Frame cache: %d videos loaded", len(_frame_cache))
 
 
 def _uniform_sample_indices(start: int, end: int, n: int) -> np.ndarray:
@@ -38,7 +68,11 @@ def _jittered_sample_indices(
 
 
 def _read_frames(video_path: str, frame_indices: np.ndarray) -> list[np.ndarray]:
-    """Read specific frames from a video file. Returns list of BGR frames."""
+    """Read specific frames — from cache if available, else from disk."""
+    cached = _frame_cache.get(video_path)
+    if cached is not None:
+        return [cached.get(int(idx)) for idx in frame_indices]
+
     cap = cv2.VideoCapture(video_path)
     frames = []
     for idx in frame_indices:
