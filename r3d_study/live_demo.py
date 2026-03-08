@@ -1,14 +1,13 @@
 """Standalone live demo script — run from terminal, not Jupyter.
 
 Usage:
-    python live_demo.py
-    python live_demo.py --camera 1
-    python live_demo.py --down 80 --up 150
+    python live_demo.py                  # Record then classify (default)
+    python live_demo.py --camera 1       # Use external webcam
 """
 
 import argparse
 import torch
-from inference import load_model, live_demo, print_results, summarize
+from inference import load_model, live_record_and_classify, print_results, summarize
 
 
 def main():
@@ -35,7 +34,7 @@ def main():
     print(f"CV accuracy: {config.get('accuracy', 0):.1%}")
     print()
 
-    results = live_demo(
+    results = live_record_and_classify(
         model=model,
         config=config,
         device=device,

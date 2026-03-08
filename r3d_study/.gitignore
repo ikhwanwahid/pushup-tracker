@@ -5,6 +5,10 @@ precomputed/
 
 # Videos (too large for git)
 videos/
+test_videos/
+
+# Debug artifacts
+debug_crops/
 
 # YOLO weights (downloaded automatically)
 *.pt

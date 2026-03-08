@@ -1,15 +1,13 @@
 """Inference pipelines for push-up rep counting + form classification.
 
-Three approaches:
-  1. infer_annotated() — human-annotated rep boundaries (most accurate)
-  2. infer_automatic() — state machine auto-detects reps from recorded video
-  3. live_demo() — real-time webcam feed with rep counting + form classification
+Two modes:
+  1. infer_automatic() — state machine auto-detects reps from recorded video
+  2. live_record_and_classify() — webcam record, then offline processing
 
-All use the best saved R3D model and YOLO keypoints.
+Both use the best saved R3D model and YOLO keypoints.
 """
 
 import logging
-from collections import deque
 from pathlib import Path
 
 import cv2
@@ -24,8 +22,6 @@ from datasets import (
     _preprocess_full_frame,
     _preprocess_cropped_frame,
     _to_tensor,
-    KINETICS_MEAN,
-    KINETICS_STD,
 )
 from state_machine import PushUpStateMachine, compute_elbow_angle
 
@@ -34,6 +30,7 @@ def _get_extract_keypoints():
     """Lazy import of data_loader to avoid pulling in pandas for live demo."""
     from data_loader import extract_keypoints
     return extract_keypoints
+
 
 logger = logging.getLogger(__name__)
 
@@ -116,82 +113,7 @@ def _classify_rep(
 
 
 # ============================================================
-# Approach 1: Annotated rep boundaries
-# ============================================================
-
-
-def infer_annotated(
-    video_path: str | Path,
-    reps: list[dict],
-    model: PushUpR3D,
-    config: dict,
-    keypoint_dir: str | Path = "keypoints",
-    device: str = "cpu",
-) -> list[dict]:
-    """Classify pre-annotated reps from a video.
-
-    Args:
-        video_path: Path to the video file.
-        reps: List of dicts, each with "start_frame", "end_frame",
-              and optionally "expected" ("good"/"bad").
-        model: Loaded R3D model.
-        config: Model config from checkpoint.
-        keypoint_dir: Directory for YOLO keypoint .npy files.
-        device: Torch device string.
-
-    Returns:
-        List of result dicts with: start_frame, end_frame, predicted,
-        confidence, expected (if provided), correct (if expected provided).
-    """
-    video_path = Path(video_path)
-    keypoint_dir = Path(keypoint_dir)
-    vid_id = video_path.stem
-
-    # Extract keypoints if needed (for crop model)
-    kps_full = None
-    if config.get("input_type") == "crop":
-        kp_path = keypoint_dir / f"{vid_id}.npy"
-        if not kp_path.exists():
-            logger.info("Extracting keypoints for %s...", vid_id)
-            _get_extract_keypoints()(
-                [{"video_id": vid_id, "video_path": str(video_path)}],
-                keypoint_dir,
-            )
-        if kp_path.exists():
-            kps_full = np.load(kp_path)
-
-    results = []
-    for rep in reps:
-        start = rep["start_frame"]
-        end = rep["end_frame"]
-
-        # Slice keypoints for this rep
-        kps_rep = None
-        if kps_full is not None:
-            kps_rep = kps_full[start:min(end + 1, len(kps_full))]
-
-        label, conf = _classify_rep(
-            model, config, str(video_path), start, end, kps_rep, device,
-        )
-
-        result = {
-            "start_frame": start,
-            "end_frame": end,
-            "predicted": label,
-            "confidence": conf,
-        }
-
-        if "expected" in rep:
-            result["expected"] = rep["expected"].upper()
-            result["correct"] = label == result["expected"]
-
-        results.append(result)
-
-    return results
-
-
-# ============================================================
-# Approach 2: Automatic rep detection via state machine
+# Automatic rep detection via state machine
 # ============================================================
 
 
@@ -231,6 +153,7 @@ def infer_automatic(
     kp_path = keypoint_dir / f"{vid_id}.npy"
     if not kp_path.exists():
         logger.info("Extracting keypoints for %s...", vid_id)
+        extract_keypoints = _get_extract_keypoints()
         extract_keypoints(
             [{"video_id": vid_id, "video_path": str(video_path)}],
             keypoint_dir,
@@ -323,12 +246,15 @@ def print_results(results: list[dict], title: str = "Inference Results") -> None
 
     has_expected = any("expected" in r for r in results)
     has_rep_num = any("rep_number" in r for r in results)
+    has_frames = any("start_frame" in r for r in results)
 
     # Header
     header = ""
     if has_rep_num:
         header += f"{'Rep':<5}"
-    header += f"{'Frames':<15} {'Predicted':<10} {'Conf':<8}"
+    if has_frames:
+        header += f"{'Frames':<15}"
+    header += f"{'Predicted':<10} {'Conf':<8}"
     if has_expected:
         header += f"{'Expected':<10} {'Match':<6}"
     print(f"  {header}")
@@ -338,7 +264,9 @@ def print_results(results: list[dict], title: str = "Inference Results") -> None
         line = ""
         if has_rep_num:
             line += f"{r.get('rep_number', '-'):<5}"
-        line += f"{r['start_frame']:>4}-{r['end_frame']:<8} {r['predicted']:<10} {r['confidence']:<8.1%}"
+        if "start_frame" in r:
+            line += f"{r['start_frame']:>4}-{r['end_frame']:<8} "
+        line += f"{r['predicted']:<10} {r['confidence']:<8.1%}"
         if has_expected:
             match = "Y" if r.get("correct") else "N"
             line += f"{r.get('expected', '?'):<10} {match:<6}"
@@ -351,7 +279,7 @@ def print_results(results: list[dict], title: str = "Inference Results") -> None
 
 
 # ============================================================
-# Approach 3: Live webcam demo
+# Live webcam: Record then classify
 # ============================================================
 
 # YOLO COCO-17 to unified 12-joint mapping
@@ -376,47 +304,6 @@ def _yolo_to_unified(native_kps: np.ndarray) -> np.ndarray:
     return unified
 
 
-def _classify_buffered_frames(
-    model: PushUpR3D,
-    config: dict,
-    frames: list[np.ndarray],
-    keypoints: list[np.ndarray],
-    device: str,
-) -> tuple[str, float]:
-    """Classify a rep from buffered BGR frames + keypoints.
-
-    Uniformly samples n_frames from the buffer, preprocesses, and runs R3D.
-    """
-    n_frames = config.get("n_frames", 16)
-    input_type = config.get("input_type", "full")
-    total = len(frames)
-
-    if total == 0:
-        return "BAD", 0.5
-
-    # Uniformly sample indices from the buffer
-    indices = np.linspace(0, total - 1, n_frames).astype(int)
-
-    if input_type == "crop" and keypoints:
-        processed = []
-        for i in indices:
-            frame = frames[min(i, total - 1)]
-            kp = keypoints[min(i, len(keypoints) - 1)]
-            processed.append(_preprocess_cropped_frame(frame, kp))
-    else:
-        processed = [_preprocess_full_frame(frames[min(i, total - 1)]) for i in indices]
-
-    tensor = torch.from_numpy(_to_tensor(processed)).unsqueeze(0).to(device)
-
-    with torch.no_grad():
-        logits = model(tensor)
-        probs = F.softmax(logits, dim=-1)
-        pred = logits.argmax(dim=-1).item()
-        confidence = probs[0, pred].item()
-
-    return "GOOD" if pred == 0 else "BAD", confidence
-
-
 def _draw_skeleton(frame: np.ndarray, unified_kps: np.ndarray, min_conf: float = 0.3) -> None:
     """Draw skeleton overlay on frame (in-place)."""
     for i, j in _SKELETON_PAIRS:
@@ -431,7 +318,7 @@ def _draw_skeleton(frame: np.ndarray, unified_kps: np.ndarray, min_conf: float =
             cv2.circle(frame, pt, 4, (0, 0, 255), -1)
 
 
-def live_demo(
+def live_record_and_classify(
     model: PushUpR3D,
     config: dict,
     device: str = "cpu",
@@ -442,30 +329,21 @@ def live_demo(
     min_rep_frames: int = 10,
     show_skeleton: bool = True,
 ) -> list[dict]:
-    """Run live webcam demo with real-time rep counting + form classification.
+    """Record webcam video, then process offline for accurate classification.
 
-    Pipeline per frame:
-        1. YOLO pose → keypoints
-        2. State machine → detect rep boundaries
-        3. On rep completion → R3D classifies the buffered frames
+    Pipeline:
+        1. Live preview with skeleton overlay
+        2. Press S to start/stop recording
+        3. On stop: YOLO extracts keypoints over full recording
+        4. State machine detects rep boundaries
+        5. R3D classifies each rep with proper crops
 
     Controls:
+        S       — start/stop recording
         Q / ESC — quit
-        R       — reset counters
-
-    Args:
-        model: Loaded R3D model.
-        config: Model config from checkpoint.
-        device: Torch device string.
-        yolo_model_path: Path to YOLO pose model weights.
-        camera_index: Webcam index (0 = default camera).
-        down_threshold: Elbow angle for "down" position.
-        up_threshold: Elbow angle for "up" position.
-        min_rep_frames: Minimum frames for a valid rep.
-        show_skeleton: Draw keypoint skeleton overlay.
 
     Returns:
-        List of result dicts for all completed reps.
+        List of result dicts for all classified reps.
     """
     from ultralytics import YOLO
 
@@ -479,22 +357,14 @@ def live_demo(
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
 
-    sm = PushUpStateMachine(
-        down_threshold=down_threshold,
-        up_threshold=up_threshold,
-    )
-
-    # Buffers for current rep's frames and keypoints
-    rep_frames: list[np.ndarray] = []
-    rep_keypoints: list[np.ndarray] = []
-    in_rep = False
-
-    # Results
+    # State
+    recording = False
+    recorded_frames: list[np.ndarray] = []
     all_results: list[dict] = []
+    status_msg = "Press S to start recording"
+    result_msg = ""
     good_count = 0
     bad_count = 0
-    last_label = ""
-    last_conf = 0.0
 
     # Colors
     GREEN = (0, 200, 0)
@@ -502,10 +372,10 @@ def live_demo(
     WHITE = (255, 255, 255)
     BLACK = (0, 0, 0)
     YELLOW = (0, 220, 220)
+    ORANGE = (0, 140, 255)
 
-    print("Live Demo Started")
-    print("  Controls: Q/ESC = quit, R = reset counters")
-    print(f"  State machine thresholds: down={down_threshold}, up={up_threshold}")
+    print("Record & Classify Demo")
+    print("  Controls: S = start/stop recording, Q/ESC = quit")
     print(f"  Model: {config.get('unfreeze', 'frozen')}, input={config.get('input_type', 'full')}")
 
     while True:
@@ -516,113 +386,152 @@ def live_demo(
         display = frame.copy()
         h, w = frame.shape[:2]
 
-        # Run YOLO pose estimation
-        results = yolo(frame, device=device, conf=0.5, verbose=False)
-        result = results[0]
-
-        unified_kps = np.zeros((12, 3), dtype=np.float32)
-        elbow_angle = 0.0
-
-        if result.keypoints is not None and len(result.keypoints):
-            kps_data = result.keypoints.data.cpu().numpy()
-            scores = result.boxes.conf.cpu().numpy() if result.boxes is not None else np.zeros(len(kps_data))
-            best_idx = int(np.argmax(scores))
-            native_kps = kps_data[best_idx]
-            unified_kps = _yolo_to_unified(native_kps)
-            elbow_angle = compute_elbow_angle(unified_kps)
-
-            if show_skeleton:
+        # Live YOLO skeleton preview
+        if show_skeleton:
+            results = yolo(frame, device=device, conf=0.5, verbose=False)
+            result = results[0]
+            if result.keypoints is not None and len(result.keypoints):
+                kps_data = result.keypoints.data.cpu().numpy()
+                scores = result.boxes.conf.cpu().numpy() if result.boxes is not None else np.zeros(len(kps_data))
+                best_idx = int(np.argmax(scores))
+                unified_kps = _yolo_to_unified(kps_data[best_idx])
                 _draw_skeleton(display, unified_kps)
 
-        # Update state machine
-        prev_state = sm.state
-        sm.update(elbow_angle)
-        curr_state = sm.state
+        if recording:
+            recorded_frames.append(frame.copy())
 
-        # Track rep buffering
-        from state_machine import PushUpPhase
+        # ---- HUD ----
+        cv2.rectangle(display, (5, 5), (400, 140), BLACK, -1)
+        cv2.rectangle(display, (5, 5), (400, 140), WHITE, 2)
 
-        if prev_state == PushUpPhase.UP and curr_state == PushUpPhase.GOING_DOWN:
-            # Rep starting — begin buffering
-            in_rep = True
-            rep_frames = []
-            rep_keypoints = []
+        if recording:
+            cv2.putText(display, f"RECORDING  [{len(recorded_frames)} frames]", (15, 35),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, RED, 2)
+            # Blinking red dot
+            if len(recorded_frames) % 30 < 15:
+                cv2.circle(display, (380, 28), 10, RED, -1)
+        else:
+            cv2.putText(display, status_msg, (15, 35),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, WHITE, 2)
 
-        if in_rep:
-            rep_frames.append(frame.copy())
-            rep_keypoints.append(unified_kps.copy())
+        if good_count + bad_count > 0:
+            cv2.putText(display, f"GOOD: {good_count}", (15, 70),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, GREEN, 2)
+            cv2.putText(display, f"BAD: {bad_count}", (200, 70),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, RED, 2)
 
-        # Rep completed
-        if prev_state == PushUpPhase.GOING_UP and curr_state == PushUpPhase.UP:
-            in_rep = False
-            if len(rep_frames) >= min_rep_frames:
-                label, conf = _classify_buffered_frames(
-                    model, config, rep_frames, rep_keypoints, device,
-                )
-                last_label = label
-                last_conf = conf
+        if result_msg:
+            cv2.putText(display, result_msg, (15, 105),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, YELLOW, 1)
 
-                if label == "GOOD":
-                    good_count += 1
-                else:
-                    bad_count += 1
+        cv2.putText(display, "S=record  Q=quit", (15, 130),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, WHITE, 1)
 
-                all_results.append({
-                    "rep_number": good_count + bad_count,
-                    "predicted": label,
-                    "confidence": conf,
-                    "n_frames": len(rep_frames),
-                })
-                print(f"  Rep {good_count + bad_count}: {label} ({conf:.1%})")
-
-            rep_frames = []
-            rep_keypoints = []
-
-        # ---- Draw HUD overlay ----
-        # Background panel
-        cv2.rectangle(display, (5, 5), (350, 175), BLACK, -1)
-        cv2.rectangle(display, (5, 5), (350, 175), WHITE, 2)
-
-        # Rep counts
-        cv2.putText(display, f"GOOD: {good_count}", (15, 40),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, GREEN, 2)
-        cv2.putText(display, f"BAD:  {bad_count}", (200, 40),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, RED, 2)
-        cv2.putText(display, f"Total: {good_count + bad_count}", (15, 75),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, WHITE, 2)
-
-        # Current state
-        state_str = curr_state.name.replace("_", " ")
-        cv2.putText(display, f"Phase: {state_str}", (15, 105),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, YELLOW, 2)
-        cv2.putText(display, f"Elbow: {elbow_angle:.0f} deg", (15, 130),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, YELLOW, 2)
-
-        # Last rep result
-        if last_label:
-            color = GREEN if last_label == "GOOD" else RED
-            cv2.putText(display, f"Last: {last_label} ({last_conf:.0%})", (15, 160),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
-
-        cv2.imshow("Push-Up Live Demo", display)
+        cv2.imshow("Record & Classify", display)
 
         key = cv2.waitKey(1) & 0xFF
-        if key in (ord("q"), 27):  # Q or ESC
+        if key in (ord("q"), 27):
             break
-        elif key == ord("r"):  # Reset
-            sm.reset()
-            good_count = 0
-            bad_count = 0
-            last_label = ""
-            last_conf = 0.0
-            all_results.clear()
-            in_rep = False
-            rep_frames = []
-            rep_keypoints = []
-            print("  Counters reset.")
+        elif key == ord("s"):
+            if not recording:
+                # Start recording
+                recording = True
+                recorded_frames = []
+                status_msg = "Recording..."
+                result_msg = ""
+                print("  Recording started...")
+            else:
+                # Stop recording — process the video
+                recording = False
+                n_frames_rec = len(recorded_frames)
+                print(f"  Recording stopped. {n_frames_rec} frames captured.")
+
+                if n_frames_rec < 20:
+                    status_msg = "Too short! Press S to try again"
+                    result_msg = ""
+                    continue
+
+                status_msg = "Processing..."
+                result_msg = "Extracting keypoints + classifying..."
+                # Force display update
+                cv2.putText(display, "Processing...", (w//2 - 100, h//2),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1.2, ORANGE, 3)
+                cv2.imshow("Record & Classify", display)
+                cv2.waitKey(1)
+
+                # -- Step 1: YOLO keypoints on all recorded frames --
+                print("  Extracting keypoints...")
+                all_kps = []
+                for i, f in enumerate(recorded_frames):
+                    res = yolo(f, device=device, conf=0.5, verbose=False)[0]
+                    unified = np.zeros((12, 3), dtype=np.float32)
+                    if res.keypoints is not None and len(res.keypoints):
+                        kd = res.keypoints.data.cpu().numpy()
+                        sc = res.boxes.conf.cpu().numpy() if res.boxes is not None else np.zeros(len(kd))
+                        nkp = kd[int(np.argmax(sc))]
+                        unified = _yolo_to_unified(nkp)
+                    all_kps.append(unified)
+                    if (i + 1) % 50 == 0:
+                        print(f"    {i+1}/{n_frames_rec} frames...")
+
+                kps_array = np.stack(all_kps)
+
+                # -- Step 2: State machine to detect reps --
+                sm = PushUpStateMachine(
+                    down_threshold=down_threshold,
+                    up_threshold=up_threshold,
+                )
+                boundaries = sm.segment_sequence(kps_array)
+                boundaries = [(s, e) for s, e in boundaries if e - s >= min_rep_frames]
+                print(f"  Detected {len(boundaries)} reps")
+
+                if not boundaries:
+                    status_msg = f"No reps detected. Press S to retry"
+                    result_msg = ""
+                    continue
+
+                # -- Step 3: Classify each rep --
+                session_results = []
+                for i, (start, end) in enumerate(boundaries):
+                    rep_f = recorded_frames[start:end + 1]
+                    rep_kps = all_kps[start:end + 1]
+
+                    n_sample = config.get("n_frames", 16)
+                    sample_idx = np.linspace(0, len(rep_f) - 1, n_sample).astype(int)
+
+                    processed = []
+                    for si in sample_idx:
+                        processed.append(
+                            _preprocess_cropped_frame(rep_f[si], rep_kps[si])
+                        )
+
+                    tensor = torch.from_numpy(_to_tensor(processed)).unsqueeze(0).to(device)
+                    with torch.no_grad():
+                        logits = model(tensor)
+                        probs = F.softmax(logits, dim=-1)
+                        pred = logits.argmax(dim=-1).item()
+                        conf = probs[0, pred].item()
+
+                    label = "GOOD" if pred == 0 else "BAD"
+                    if label == "GOOD":
+                        good_count += 1
+                    else:
+                        bad_count += 1
+
+                    session_results.append({
+                        "rep_number": good_count + bad_count,
+                        "predicted": label,
+                        "confidence": conf,
+                        "start_frame": start,
+                        "end_frame": end,
+                    })
+                    print(f"    Rep {i+1}: {label} ({conf:.1%}) [frames {start}-{end}]")
+
+                all_results.extend(session_results)
+                status_msg = f"Done! {good_count} GOOD, {bad_count} BAD. Press S for more"
+                result_msg = f"Last session: {len(session_results)} reps detected"
 
     cap.release()
     cv2.destroyAllWindows()
-
-    print(f"\nSession ended: {good_count} GOOD, {bad_count} BAD, {good_count + bad_count} total")
+    print(f"\nTotal: {good_count} GOOD, {bad_count} BAD")
     return all_results
