@@ -341,6 +341,9 @@ def live_realtime(
     sm = PushUpStateMachine(
         down_threshold=down_threshold,
         up_threshold=up_threshold,
+        smooth_window=5,
+        adaptive=True,
+        calibration_reps=2,
     )
 
     # Buffer for current rep's keypoints
@@ -360,10 +363,12 @@ def live_realtime(
     WHITE = (255, 255, 255)
     BLACK = (0, 0, 0)
     YELLOW = (0, 220, 220)
+    CYAN = (255, 200, 0)
 
     print("ST-GCN Real-Time Demo")
     print("  Controls: Q/ESC = quit, R = reset counters")
-    print(f"  State machine thresholds: down={down_threshold}, up={up_threshold}")
+    print(f"  Initial thresholds: down={down_threshold}, up={up_threshold}")
+    print("  Adaptive calibration: ON (first 2 reps calibrate thresholds)")
     n_frames = config.get("n_frames", 32)
     in_channels = config.get("in_channels", 2)
     print(f"  Model: {len(config.get('channels', []))} blocks, "
@@ -429,14 +434,20 @@ def live_realtime(
                     "confidence": conf,
                     "n_frames": len(rep_keypoints),
                 })
-                print(f"  Rep {good_count + bad_count}: {label} ({conf:.1%}) "
+                rep_num = good_count + bad_count
+                print(f"  Rep {rep_num}: {label} ({conf:.1%}) "
                       f"[{len(rep_keypoints)} frames]")
+
+                # Print when calibration completes
+                if sm._calibrated and rep_num == sm._calibration_reps:
+                    print(f"  >> Calibrated! Thresholds: down={sm.down_threshold:.0f}, "
+                          f"up={sm.up_threshold:.0f}")
 
             rep_keypoints = []
 
         # ---- Draw HUD overlay ----
-        cv2.rectangle(display, (5, 5), (350, 175), BLACK, -1)
-        cv2.rectangle(display, (5, 5), (350, 175), WHITE, 2)
+        cv2.rectangle(display, (5, 5), (380, 210), BLACK, -1)
+        cv2.rectangle(display, (5, 5), (380, 210), WHITE, 2)
 
         cv2.putText(display, f"GOOD: {good_count}", (15, 40),
                     cv2.FONT_HERSHEY_SIMPLEX, 1.0, GREEN, 2)
@@ -451,9 +462,16 @@ def live_realtime(
         cv2.putText(display, f"Elbow: {elbow_angle:.0f} deg", (15, 130),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, YELLOW, 2)
 
+        # Show current thresholds and calibration status
+        cal_str = "CALIBRATED" if sm._calibrated else f"Calibrating ({len(sm._observed_mins)}/{sm._calibration_reps})"
+        cv2.putText(display, cal_str, (15, 155),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, CYAN, 1)
+        cv2.putText(display, f"Thresholds: {sm.down_threshold:.0f}-{sm.up_threshold:.0f}", (15, 175),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, CYAN, 1)
+
         if last_label:
             color = GREEN if last_label == "GOOD" else RED
-            cv2.putText(display, f"Last: {last_label} ({last_conf:.0%})", (15, 160),
+            cv2.putText(display, f"Last: {last_label} ({last_conf:.0%})", (15, 200),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
         cv2.imshow("ST-GCN Push-Up Demo", display)
