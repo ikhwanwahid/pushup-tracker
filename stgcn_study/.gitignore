@@ -1,0 +1,17 @@
+# Generated data (re-created by notebook)
+keypoints/
+outputs/
+
+# Videos (too large for git)
+videos/
+test_videos/
+
+# YOLO weights (downloaded automatically)
+*.pt
+
+# Annotations (team-specific, not in repo)
+annotations_template.xlsx
+
+# Python cache
+__pycache__/
+*.py[oc]
