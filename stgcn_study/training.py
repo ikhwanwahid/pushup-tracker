@@ -52,13 +52,14 @@ def evaluate(
     criterion: nn.Module,
     device: torch.device,
 ) -> tuple[float, float, list[int], list[int]]:
-    """Evaluate model, return (loss, accuracy, predictions, true_labels)."""
+    """Evaluate model, return (loss, accuracy, predictions, true_labels, confidences)."""
     model.eval()
     total_loss = 0.0
     correct = 0
     total = 0
     all_preds = []
     all_labels = []
+    all_confs = []
 
     with torch.no_grad():
         for inputs, labels in loader:
@@ -69,16 +70,19 @@ def evaluate(
             loss = criterion(logits, labels)
             total_loss += loss.item()
 
+            probs = torch.softmax(logits, dim=-1)
             preds = logits.argmax(dim=-1)
+            confs = probs[torch.arange(len(preds)), preds]
             correct += (preds == labels).sum().item()
             total += labels.numel()
 
             all_preds.extend(preds.cpu().tolist())
             all_labels.extend(labels.cpu().tolist())
+            all_confs.extend(confs.cpu().tolist())
 
     n_batches = max(len(loader), 1)
     accuracy = correct / max(total, 1)
-    return total_loss / n_batches, accuracy, all_preds, all_labels
+    return total_loss / n_batches, accuracy, all_preds, all_labels, all_confs
 
 
 def run_rep_kfold_cv(
@@ -136,6 +140,7 @@ def run_rep_kfold_cv(
 
     per_rep_preds = [None] * len(rep_segments)
     per_rep_true = [rep["label"] for rep in rep_segments]
+    per_rep_confs = [None] * len(rep_segments)
 
     fold_results = []
     best_overall_acc = 0.0
@@ -186,7 +191,7 @@ def run_rep_kfold_cv(
             train_loss = train_one_epoch(
                 model, train_loader, optimizer, criterion, device,
             )
-            val_loss, val_acc, _, _ = evaluate(
+            val_loss, val_acc, _, _, _ = evaluate(
                 model, val_loader, criterion, device,
             )
 
@@ -222,12 +227,13 @@ def run_rep_kfold_cv(
             model.load_state_dict(best_epoch_state)
             model.to(device)
 
-        _, final_acc, final_preds, _ = evaluate(
+        _, final_acc, final_preds, _, final_confs = evaluate(
             model, val_loader, criterion, device,
         )
 
         for i, rep_idx in enumerate(val_rep_indices):
             per_rep_preds[rep_idx] = final_preds[i]
+            per_rep_confs[rep_idx] = final_confs[i]
 
         fold_results.append({
             "fold": fold,
@@ -250,6 +256,7 @@ def run_rep_kfold_cv(
         "fold_results": fold_results,
         "per_rep_preds": per_rep_preds,
         "per_rep_true": per_rep_true,
+        "per_rep_confs": per_rep_confs,
         "best_state": best_state,
         "best_accuracy": best_overall_acc,
     }
