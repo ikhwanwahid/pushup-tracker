@@ -91,25 +91,32 @@ class PushUpPhase(Enum):
 
 
 class PushUpStateMachine:
-    """Counts push-up reps by tracking elbow angle transitions.
+    """Counts push-up reps using peak/valley detection on the elbow angle.
+
+    Instead of requiring fixed absolute thresholds, this detects reps by
+    tracking relative changes in the smoothed elbow angle signal:
+      - A "valley" (rep bottom) is detected when the angle drops by at least
+        `min_drop` degrees from a recent peak, then starts rising again.
+      - A rep completes when the angle recovers by at least `min_rise` degrees
+        from the valley.
+
+    This handles bad-form reps that don't reach standard angles (arched back,
+    shallow dips, split movements).
 
     Features:
         - Moving-average smoothing to reduce noisy keypoint jitter
-        - Adaptive calibration: learns the user's actual angle range from the
-          first few reps and adjusts thresholds automatically
-
-    State transitions:
-        UP -> GOING_DOWN: elbow angle drops below up_threshold
-        GOING_DOWN -> DOWN: elbow angle drops below down_threshold
-        DOWN -> GOING_UP: elbow angle rises above down_threshold
-        GOING_UP -> UP: elbow angle rises above up_threshold (count + 1)
+        - Relative peak/valley detection — no fixed angle thresholds needed
+        - Tracks rep boundaries (start_frame, end_frame) for classification
     """
 
     def __init__(
         self,
+        smooth_window: int = 5,
+        min_drop: float = 30.0,
+        min_rise: float = 30.0,
+        # Legacy thresholds kept for backward compatibility but unused
         down_threshold: float = 90.0,
         up_threshold: float = 160.0,
-        smooth_window: int = 5,
         adaptive: bool = False,
         calibration_reps: int = 2,
     ):
@@ -125,14 +132,12 @@ class PushUpStateMachine:
         self._smooth_window = smooth_window
         self._angle_buffer: list[float] = []
 
-        # Adaptive calibration
-        self._adaptive = adaptive
-        self._calibration_reps = calibration_reps
-        self._calibrated = False
-        self._observed_mins: list[float] = []
-        self._observed_maxs: list[float] = []
-        self._current_rep_min: float = 180.0
-        self._current_rep_max: float = 0.0
+        # Peak/valley detection
+        self._min_drop = min_drop
+        self._min_rise = min_rise
+        self._recent_peak: float = 0.0  # Highest angle since last valley
+        self._recent_valley: float = 180.0  # Lowest angle since last peak
+        self._found_valley: bool = False  # Whether we've seen a significant dip
 
     def _smooth(self, raw_angle: float) -> float:
         """Apply moving-average smoothing."""
@@ -141,48 +146,45 @@ class PushUpStateMachine:
             self._angle_buffer.pop(0)
         return sum(self._angle_buffer) / len(self._angle_buffer)
 
-    def _recalibrate(self) -> None:
-        """Set thresholds based on observed angle range from calibration reps."""
-        if not self._observed_mins or not self._observed_maxs:
-            return
-
-        avg_min = sum(self._observed_mins) / len(self._observed_mins)
-        avg_max = sum(self._observed_maxs) / len(self._observed_maxs)
-        angle_range = avg_max - avg_min
-
-        if angle_range < 20:  # Too narrow — don't calibrate
-            return
-
-        # Set thresholds at 30% and 70% of observed range
-        self.down_threshold = avg_min + angle_range * 0.3
-        self.up_threshold = avg_min + angle_range * 0.7
-        self._calibrated = True
-
     def update(self, elbow_angle: float) -> PushUpPhase:
         """Update state machine with a new elbow angle reading."""
         angle = self._smooth(elbow_angle)
 
-        # Track min/max for adaptive calibration
-        if self._adaptive and not self._calibrated:
-            self._current_rep_min = min(self._current_rep_min, angle)
-            self._current_rep_max = max(self._current_rep_max, angle)
+        # Skip zero angles (person not detected)
+        if angle < 1.0:
+            self._frame_idx += 1
+            return self.state
 
         prev_state = self.state
 
-        if self.state == PushUpPhase.UP:
-            if angle < self.up_threshold:
-                self.state = PushUpPhase.GOING_DOWN
+        if not self._found_valley:
+            # Looking for a valley: track the peak and watch for a drop
+            if angle > self._recent_peak:
+                self._recent_peak = angle
 
-        elif self.state == PushUpPhase.GOING_DOWN:
-            if angle <= self.down_threshold:
+            self._recent_valley = min(self._recent_valley, angle)
+            drop = self._recent_peak - angle
+
+            if drop >= self._min_drop:
+                # Significant drop detected — we're in a valley
+                self._found_valley = True
+                self._recent_valley = angle
                 self.state = PushUpPhase.DOWN
 
-        elif self.state == PushUpPhase.DOWN:
-            if angle > self.down_threshold:
-                self.state = PushUpPhase.GOING_UP
+                # Mark rep start at the peak before this drop
+                if self._current_rep_start is None:
+                    self._current_rep_start = max(0, self._frame_idx - 1)
+                    self.state = PushUpPhase.GOING_DOWN
+        else:
+            # In a valley — track the minimum and watch for recovery
+            if angle < self._recent_valley:
+                self._recent_valley = angle
+                self.state = PushUpPhase.DOWN
 
-        elif self.state == PushUpPhase.GOING_UP:
-            if angle >= self.up_threshold:
+            rise = angle - self._recent_valley
+
+            if rise >= self._min_rise:
+                # Recovery detected — rep complete
                 self.state = PushUpPhase.UP
                 self.count += 1
                 if self._current_rep_start is not None:
@@ -191,19 +193,12 @@ class PushUpStateMachine:
                     )
                 self._current_rep_start = None
 
-                # Adaptive calibration: record this rep's range
-                if self._adaptive and not self._calibrated:
-                    self._observed_mins.append(self._current_rep_min)
-                    self._observed_maxs.append(self._current_rep_max)
-                    self._current_rep_min = 180.0
-                    self._current_rep_max = 0.0
-
-                    if len(self._observed_mins) >= self._calibration_reps:
-                        self._recalibrate()
-
-        # Track rep start: UP -> GOING_DOWN
-        if prev_state == PushUpPhase.UP and self.state == PushUpPhase.GOING_DOWN:
-            self._current_rep_start = self._frame_idx
+                # Reset for next rep
+                self._recent_peak = angle
+                self._recent_valley = 180.0
+                self._found_valley = False
+            elif angle > self._recent_valley:
+                self.state = PushUpPhase.GOING_UP
 
         self._frame_idx += 1
         return self.state
@@ -221,11 +216,9 @@ class PushUpStateMachine:
         self._current_rep_start = None
         self._rep_boundaries.clear()
         self._angle_buffer.clear()
-        self._observed_mins.clear()
-        self._observed_maxs.clear()
-        self._current_rep_min = 180.0
-        self._current_rep_max = 0.0
-        self._calibrated = False
+        self._recent_peak = 0.0
+        self._recent_valley = 180.0
+        self._found_valley = False
 
     @property
     def rep_boundaries(self) -> list[tuple[int, int]]:

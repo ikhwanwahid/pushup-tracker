@@ -170,9 +170,13 @@ def infer_automatic(
     logger.info("Detected %d reps in %s", len(boundaries), vid_id)
 
     # Step 3: Classify each detected rep (skeleton only)
+    # Pad boundaries to give classifier full rep context
+    pad = 10
     results = []
     for i, (start, end) in enumerate(boundaries):
-        kps_rep = kps_full[start:min(end + 1, len(kps_full))]
+        s = max(0, start - pad)
+        e = min(len(kps_full), end + pad + 1)
+        kps_rep = kps_full[s:e]
 
         label, conf = _classify_rep_skeleton(model, config, kps_rep, device)
 
@@ -339,15 +343,17 @@ def live_realtime(
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
 
     sm = PushUpStateMachine(
-        down_threshold=down_threshold,
-        up_threshold=up_threshold,
         smooth_window=5,
-        adaptive=True,
-        calibration_reps=2,
+        min_drop=30.0,
+        min_rise=30.0,
     )
 
     # Buffer for current rep's keypoints
     rep_keypoints: list[np.ndarray] = []
+    recent_keypoints: list[np.ndarray] = []  # Rolling buffer for pre-rep context
+    pre_pad = 10  # Frames to keep before rep starts
+    post_pad = 10  # Extra frames to buffer after rep completes
+    post_pad_remaining = 0
     in_rep = False
 
     # Results
@@ -363,12 +369,9 @@ def live_realtime(
     WHITE = (255, 255, 255)
     BLACK = (0, 0, 0)
     YELLOW = (0, 220, 220)
-    CYAN = (255, 200, 0)
-
     print("ST-GCN Real-Time Demo")
     print("  Controls: Q/ESC = quit, R = reset counters")
-    print(f"  Initial thresholds: down={down_threshold}, up={up_threshold}")
-    print("  Adaptive calibration: ON (first 2 reps calibrate thresholds)")
+    print("  Rep detection: peak/valley (min_drop=30, min_rise=30)")
     n_frames = config.get("n_frames", 32)
     in_channels = config.get("in_channels", 2)
     print(f"  Model: {len(config.get('channels', []))} blocks, "
@@ -404,50 +407,59 @@ def live_realtime(
         sm.update(elbow_angle)
         curr_state = sm.state
 
+        # Always maintain a rolling buffer of recent keypoints
+        recent_keypoints.append(unified_kps.copy())
+        if len(recent_keypoints) > pre_pad:
+            recent_keypoints.pop(0)
+
         # Track rep buffering
-        if prev_state == PushUpPhase.UP and curr_state == PushUpPhase.GOING_DOWN:
-            in_rep = True
-            rep_keypoints = []
+        if not in_rep and curr_state in (PushUpPhase.GOING_DOWN, PushUpPhase.DOWN):
+            if prev_state == PushUpPhase.UP:
+                in_rep = True
+                # Seed with pre-rep context from rolling buffer
+                rep_keypoints = list(recent_keypoints)
 
         if in_rep:
             rep_keypoints.append(unified_kps.copy())
 
-        # Rep completed — classify immediately from keypoints
+        # Rep completed — collect post-pad frames then classify
         if prev_state == PushUpPhase.GOING_UP and curr_state == PushUpPhase.UP:
-            in_rep = False
-            if len(rep_keypoints) >= min_rep_frames:
-                kps_array = np.stack(rep_keypoints)  # (T, 12, 3)
-                label, conf = _classify_rep_skeleton(
-                    model, config, kps_array, device,
-                )
-                last_label = label
-                last_conf = conf
+            post_pad_remaining = post_pad
 
-                if label == "GOOD":
-                    good_count += 1
-                else:
-                    bad_count += 1
+        if post_pad_remaining > 0:
+            rep_keypoints.append(unified_kps.copy())
+            post_pad_remaining -= 1
 
-                all_results.append({
-                    "rep_number": good_count + bad_count,
-                    "predicted": label,
-                    "confidence": conf,
-                    "n_frames": len(rep_keypoints),
-                })
-                rep_num = good_count + bad_count
-                print(f"  Rep {rep_num}: {label} ({conf:.1%}) "
-                      f"[{len(rep_keypoints)} frames]")
+            if post_pad_remaining == 0 and in_rep:
+                in_rep = False
+                if len(rep_keypoints) >= min_rep_frames:
+                    kps_array = np.stack(rep_keypoints)  # (T, 12, 3)
+                    label, conf = _classify_rep_skeleton(
+                        model, config, kps_array, device,
+                    )
+                    last_label = label
+                    last_conf = conf
 
-                # Print when calibration completes
-                if sm._calibrated and rep_num == sm._calibration_reps:
-                    print(f"  >> Calibrated! Thresholds: down={sm.down_threshold:.0f}, "
-                          f"up={sm.up_threshold:.0f}")
+                    if label == "GOOD":
+                        good_count += 1
+                    else:
+                        bad_count += 1
 
-            rep_keypoints = []
+                    all_results.append({
+                        "rep_number": good_count + bad_count,
+                        "predicted": label,
+                        "confidence": conf,
+                        "n_frames": len(rep_keypoints),
+                    })
+                    rep_num = good_count + bad_count
+                    print(f"  Rep {rep_num}: {label} ({conf:.1%}) "
+                          f"[{len(rep_keypoints)} frames]")
+
+                rep_keypoints = []
 
         # ---- Draw HUD overlay ----
-        cv2.rectangle(display, (5, 5), (380, 210), BLACK, -1)
-        cv2.rectangle(display, (5, 5), (380, 210), WHITE, 2)
+        cv2.rectangle(display, (5, 5), (350, 175), BLACK, -1)
+        cv2.rectangle(display, (5, 5), (350, 175), WHITE, 2)
 
         cv2.putText(display, f"GOOD: {good_count}", (15, 40),
                     cv2.FONT_HERSHEY_SIMPLEX, 1.0, GREEN, 2)
@@ -462,16 +474,9 @@ def live_realtime(
         cv2.putText(display, f"Elbow: {elbow_angle:.0f} deg", (15, 130),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, YELLOW, 2)
 
-        # Show current thresholds and calibration status
-        cal_str = "CALIBRATED" if sm._calibrated else f"Calibrating ({len(sm._observed_mins)}/{sm._calibration_reps})"
-        cv2.putText(display, cal_str, (15, 155),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, CYAN, 1)
-        cv2.putText(display, f"Thresholds: {sm.down_threshold:.0f}-{sm.up_threshold:.0f}", (15, 175),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, CYAN, 1)
-
         if last_label:
             color = GREEN if last_label == "GOOD" else RED
-            cv2.putText(display, f"Last: {last_label} ({last_conf:.0%})", (15, 200),
+            cv2.putText(display, f"Last: {last_label} ({last_conf:.0%})", (15, 160),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
         cv2.imshow("ST-GCN Push-Up Demo", display)

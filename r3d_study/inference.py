@@ -182,12 +182,16 @@ def infer_automatic(
     logger.info("Detected %d reps in %s", len(boundaries), vid_id)
 
     # Step 3: Classify each detected rep
+    # Pad boundaries to give classifier full rep context
+    pad = 10
     results = []
     for i, (start, end) in enumerate(boundaries):
-        kps_rep = kps_full[start:min(end + 1, len(kps_full))]
+        s = max(0, start - pad)
+        e = min(len(kps_full) - 1, end + pad)
+        kps_rep = kps_full[s:e + 1]
 
         label, conf = _classify_rep(
-            model, config, str(video_path), start, end, kps_rep, device,
+            model, config, str(video_path), s, e, kps_rep, device,
         )
 
         results.append({
